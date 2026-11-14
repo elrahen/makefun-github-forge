@@ -687,12 +687,18 @@ function diffFiles(baseFiles: Map<string, Buffer>, headFiles: Map<string, Buffer
 }
 
 /** MERGEABLE when the head's changes do not touch a path the base also changed differently. */
+/** The base branch's current tip (a PR's base is a branch, not a frozen sha). */
+function currentBaseSha(repo: Repo, pr: Pull): string {
+  return repo.refs.get(`refs/heads/${pr.base}`) ?? pr.baseSha;
+}
+
 function mergeableState(repo: Repo, pr: Pull): 'MERGEABLE' | 'CONFLICTING' {
-  const mb = mergeBase(pr.headSha, pr.baseSha);
+  const baseTip = currentBaseSha(repo, pr);
+  const mb = mergeBase(pr.headSha, baseTip);
   if (mb === null) return 'MERGEABLE';
   const mbFiles = commitFiles(mb);
   const headFiles = commitFiles(pr.headSha);
-  const baseFiles = commitFiles(pr.baseSha);
+  const baseFiles = commitFiles(baseTip);
   const headChanges = new Map<string, Buffer | null>();
   for (const c of diffFiles(mbFiles, headFiles)) headChanges.set(c.path, headFiles.get(c.path) ?? null);
   for (const c of diffFiles(mbFiles, baseFiles)) {
@@ -709,17 +715,19 @@ function mergeableState(repo: Repo, pr: Pull): 'MERGEABLE' | 'CONFLICTING' {
 /** Squash-merge a PR onto its base branch; returns the merge commit oid or null on conflict. */
 function squashMerge(repo: Repo, pr: Pull): string | null {
   if (mergeableState(repo, pr) === 'CONFLICTING') return null;
+  const baseTip = currentBaseSha(repo, pr);
   const files = commitFiles(pr.headSha);
   const tree = filesToTree(files);
   const { sec, iso } = stamp();
   const message = `Merge pull request #${pr.number} from ${pr.head}\n\n${pr.title}`;
-  const oid = putObject('commit', buildCommit(tree, [pr.baseSha], message, sec));
+  const oid = putObject('commit', buildCommit(tree, [baseTip], message, sec));
   repo.refs.set(`refs/heads/${pr.base}`, oid);
   repo.fileCache.set(oid, new Map(files));
   pr.state = 'closed';
   pr.merged = true;
   pr.mergedAt = iso;
   pr.mergeCommitSha = oid;
+  pr.baseSha = oid;
   pr.updatedAt = iso;
   return oid;
 }
@@ -1004,7 +1012,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
         return {
           sha: oid, node_id: b64url(`C:${oid}`),
           commit: {
-            message: c.message,
+            // GitHub presents the message without the stored trailing newline.
+            message: c.message.replace(/\n$/, ''),
             author: { name: m?.[1] ?? VIEWER_LOGIN, email: m?.[2] ?? VIEWER_EMAIL, date },
             committer: { name: m?.[1] ?? VIEWER_LOGIN, email: m?.[2] ?? VIEWER_EMAIL, date },
             tree: { sha: c.tree },
@@ -1358,13 +1367,16 @@ function v2Advertisement(repo: Repo): Buffer {
 
 interface FetchPlan { objects: GitObj[]; shallow: string[]; unshallow: string[]; }
 
-/** The objects a fetch must send, per the v2/v0 negotiation rules. */
+/** The objects a fetch must send, per the v2/v0 negotiation rules.
+ * Depth-aware: a commit is sent with its tree closure, but its parents are
+ * only walked while the depth allows, so a depth-1 fetch never carries
+ * history beyond the tip. */
 function computeFetch(wants: string[], haves: string[], shallowArgs: string[], depth: number | undefined): FetchPlan {
   const haveSet = new Set(haves);
   const shallowSet = new Set(shallowArgs);
-  const include = new Set<string>();
   const newShallow: string[] = [];
   const unshallow: string[] = [];
+  const send = new Set<string>();
   const queue: Array<{ oid: string; d: number }> = wants.map((w) => ({ oid: w, d: 1 }));
   const visited = new Set<string>();
   while (queue.length) {
@@ -1374,11 +1386,11 @@ function computeFetch(wants: string[], haves: string[], shallowArgs: string[], d
     const obj = objects.get(oid);
     if (!obj) continue;
     if (obj.type === 'tag') {
-      include.add(oid);
+      send.add(oid);
       queue.push({ oid: parseTag(obj.data).object, d });
       continue;
     }
-    if (obj.type !== 'commit') { include.add(oid); continue; }
+    if (obj.type !== 'commit') { send.add(oid); continue; }
     const isHave = haveSet.has(oid);
     const isBoundary = shallowSet.has(oid);
     if (isHave && !isBoundary) continue;
@@ -1389,11 +1401,14 @@ function computeFetch(wants: string[], haves: string[], shallowArgs: string[], d
       }
       continue;
     }
-    include.add(oid);
+    // Not held: send the commit and its tree closure, but walk parents only
+    // while the depth allows.
+    send.add(oid);
+    for (const x of collectReachable([parseCommit(obj.data).tree])) send.add(x);
     if (depth !== undefined && d >= depth) { newShallow.push(oid); continue; }
     for (const p of parseCommit(obj.data).parents) queue.push({ oid: p, d: d + 1 });
   }
-  const all = collectReachable(include);
+  // Filter out objects the client already holds.
   const held = new Set<string>();
   for (const h of haveSet) {
     if (shallowSet.has(h)) {
@@ -1408,8 +1423,8 @@ function computeFetch(wants: string[], haves: string[], shallowArgs: string[], d
       for (const x of collectReachable([h])) held.add(x);
     }
   }
-  const send = [...all].filter((oid) => !held.has(oid)).sort();
-  return { objects: send.map((oid) => objects.get(oid)!).filter((o) => o !== undefined), shallow: newShallow, unshallow };
+  const final = [...send].filter((oid) => !held.has(oid)).sort();
+  return { objects: final.map((oid) => objects.get(oid)!).filter((o) => o !== undefined), shallow: newShallow, unshallow };
 }
 
 /** Split a pack into sideband band-1 pkt-lines. */
@@ -1508,7 +1523,10 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
       const out: Array<string | 'flush'> = [];
       const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
       const headOid = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-      if (symrefs) {
+      // The HEAD symref line is only returned when no ref-prefix filters it
+      // out (HEAD is not under refs/heads/).
+      const headAllowed = prefixes.length === 0 || prefixes.some((p) => 'HEAD'.startsWith(p));
+      if (symrefs && headAllowed) {
         if (headOid) out.push(`${headOid} HEAD symref-target:refs/heads/${repo.defaultBranch}\n`);
         else if (unborn) out.push(`unborn HEAD symref-target:refs/heads/${repo.defaultBranch}\n`);
       }
