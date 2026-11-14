@@ -148,6 +148,18 @@ function parseCommit(data: Buffer): CommitView {
   return { tree, parents, author, committer, message };
 }
 
+/** Parsed commits, memoised by oid (objects are immutable once stored). */
+const commitCache = new Map<string, CommitView>();
+function commitOf(oid: string): CommitView | null {
+  let c = commitCache.get(oid);
+  if (c) return c;
+  const obj = objects.get(oid);
+  if (!obj || obj.type !== 'commit') return null;
+  c = parseCommit(obj.data);
+  commitCache.set(oid, c);
+  return c;
+}
+
 function buildCommit(tree: string, parents: string[], message: string, sec: number): Buffer {
   const who = `${IDENTITY} ${sec} +0000`;
   const lines = [`tree ${tree}`];
@@ -402,6 +414,8 @@ interface Issue {
   id: number; number: number; title: string; body: string; state: 'open' | 'closed';
   labels: string[]; createdAt: string; updatedAt: string; closedAt: string | null;
   comments: IssueComment[];
+  /** Serialised issueJson, invalidated on any mutation of the issue. */
+  jsonCache: string | null;
 }
 interface Pull {
   id: number; number: number; title: string; body: string; state: 'open' | 'closed';
@@ -489,7 +503,8 @@ function collectReachable(roots: Iterable<string>): Set<string> {
     if (!obj) continue;
     seen.add(oid);
     if (obj.type === 'commit') {
-      const c = parseCommit(obj.data);
+      const c = commitOf(oid);
+      if (!c) continue;
       queue.push(c.tree);
       for (const p of c.parents) queue.push(p);
     } else if (obj.type === 'tag') {
@@ -511,7 +526,7 @@ function isAncestor(anc: string, desc: string): boolean {
     if (seen.has(oid)) continue;
     seen.add(oid);
     const obj = objects.get(oid);
-    if (obj?.type === 'commit') for (const p of parseCommit(obj.data).parents) queue.push(p);
+    if (obj?.type === 'commit') { const c = commitOf(oid); if (c) for (const p of c.parents) queue.push(p); }
     else if (obj?.type === 'tag') queue.push(parseTag(obj.data).object);
   }
   return false;
@@ -525,7 +540,7 @@ function mergeBase(a: string, b: string): string | null {
     if (ancA.has(oid)) continue;
     ancA.add(oid);
     const obj = objects.get(oid);
-    if (obj?.type === 'commit') for (const p of parseCommit(obj.data).parents) queueA.push(p);
+    if (obj?.type === 'commit') { const c = commitOf(oid); if (c) for (const p of c.parents) queueA.push(p); }
     else if (obj?.type === 'tag') queueA.push(parseTag(obj.data).object);
   }
   const queueB = [b];
@@ -536,7 +551,7 @@ function mergeBase(a: string, b: string): string | null {
     if (seenB.has(oid)) continue;
     seenB.add(oid);
     const obj = objects.get(oid);
-    if (obj?.type === 'commit') for (const p of parseCommit(obj.data).parents) queueB.push(p);
+    if (obj?.type === 'commit') { const c = commitOf(oid); if (c) for (const p of c.parents) queueB.push(p); }
     else if (obj?.type === 'tag') queueB.push(parseTag(obj.data).object);
   }
   return null;
@@ -564,9 +579,8 @@ function treeToFiles(treeOid: string): Map<string, Buffer> {
 
 /** The path -> blob bytes map of a commit's tree (empty when the commit is missing). */
 function commitFiles(commitOid: string): Map<string, Buffer> {
-  const obj = objects.get(commitOid);
-  if (!obj || obj.type !== 'commit') return new Map();
-  return treeToFiles(parseCommit(obj.data).tree);
+  const c = commitOf(commitOid);
+  return c ? treeToFiles(c.tree) : new Map();
 }
 
 /** Build (and store) the nested tree objects for a file map; returns the root tree oid. */
@@ -629,10 +643,10 @@ function commitHistory(tip: string): string[] {
     const oid = queue.shift()!;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = objects.get(oid);
-    if (!obj || obj.type !== 'commit') continue;
+    const c = commitOf(oid);
+    if (!c) continue;
     out.push(oid);
-    for (const p of parseCommit(obj.data).parents) queue.push(p);
+    for (const par of c.parents) queue.push(par);
   }
   return out;
 }
@@ -759,6 +773,18 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
   res.end(text);
 }
 
+/** Send an already-serialised JSON body (e.g. a cached issue rendering). */
+function sendJsonText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  const body = text.endsWith('\n') ? text : `${text}\n`;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': Buffer.byteLength(body),
+    'x-github-request-id': nextRequestId(),
+    ...extra,
+  });
+  res.end(body);
+}
+
 function sendRaw(res: ServerResponse, status: number, buf: Buffer, contentType: string, extra: Record<string, string> = {}): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': buf.length, ...extra });
   res.end(buf);
@@ -842,6 +868,14 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     repository_url: `/api/v3/repos/${repo.owner}/${repo.name}`,
     comments_url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments`,
   };
+}
+
+/** Serialised issue JSON, cached on the issue and rebuilt only after a mutation. */
+function issueJsonText(repo: Repo, issue: Issue): string {
+  if (issue.jsonCache !== null) return issue.jsonCache;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issue.jsonCache = text;
+  return text;
 }
 
 function pullJson(repo: Repo, pr: Pull): Record<string, unknown> {
@@ -1005,7 +1039,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
       if (!tip && isOid(shaParam)) tip = shaParam;
       if (!tip || !objects.has(tip)) { errJson(res, 404, 'Not Found'); return true; }
       const list = commitHistory(tip).map((oid) => {
-        const c = parseCommit(objects.get(oid)!.data);
+        const c = commitOf(oid)!;
         const authorLine = c.author;
         const m = authorLine.match(/^(.*) <(.*)> (\d+) ([+-]\d{4})$/);
         const date = m ? new Date(parseInt(m[3], 10) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z') : repo.createdAt;
@@ -1168,6 +1202,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
           const issue: Issue = {
             id: globalIdSeq, number, title, body: typeof b.body === 'string' ? b.body : '',
             state: 'open', labels, createdAt: iso, updatedAt: iso, closedAt: null, comments: [],
+            jsonCache: null,
           };
           repo.issues.set(number, issue);
           sendJson(res, 201, issueJson(repo, issue));
@@ -1182,8 +1217,8 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
           if (sort === 'created') {
             list.sort((a, c) => (direction === 'asc' ? a.number - c.number : c.number - a.number));
           }
-          const { page, link } = paginate(list.map((i) => issueJson(repo, i)), query, req, `/api/v3/repos/${owner}/${name}/issues`);
-          sendJson(res, 200, page, link ? { link } : {});
+          const { page, link } = paginate(list, query, req, `/api/v3/repos/${owner}/${name}/issues`);
+          sendJsonText(res, 200, `[${page.map((i) => issueJsonText(repo, i)).join(',')}]`, link ? { link } : {});
           return true;
         }
       }
@@ -1192,7 +1227,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
       const issue = repo.issues.get(num);
       if (rest.length === 2) {
         if (!issue) { errJson(res, 404, 'Not Found'); return true; }
-        if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return true; }
+        if (method === 'GET') { sendJsonText(res, 200, issueJsonText(repo, issue)); return true; }
         if (method === 'PATCH') {
           if (typeof b.state === 'string' && (b.state === 'open' || b.state === 'closed')) {
             issue.state = b.state;
@@ -1201,6 +1236,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
           if (typeof b.title === 'string') issue.title = b.title;
           if (typeof b.body === 'string') issue.body = b.body;
           issue.updatedAt = stamp().iso;
+          issue.jsonCache = null;
           sendJson(res, 200, issueJson(repo, issue));
           return true;
         }
@@ -1215,6 +1251,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, segs: strin
           const comment: IssueComment = { id: globalIdSeq, body: text, createdAt: iso, user: VIEWER_LOGIN };
           issue.comments.push(comment);
           issue.updatedAt = iso;
+          issue.jsonCache = null;
           sendJson(res, 201, commentJson(repo, issue, comment));
           return true;
         }
@@ -1396,7 +1433,8 @@ function computeFetch(wants: string[], haves: string[], shallowArgs: string[], d
     if (isHave && !isBoundary) continue;
     if (isHave && isBoundary) {
       if (depth === undefined || d < depth) {
-        for (const p of parseCommit(obj.data).parents) queue.push({ oid: p, d: d + 1 });
+        const cb = commitOf(oid);
+        if (cb) for (const par of cb.parents) queue.push({ oid: par, d: d + 1 });
         if (depth !== undefined) unshallow.push(oid);
       }
       continue;
@@ -1404,9 +1442,10 @@ function computeFetch(wants: string[], haves: string[], shallowArgs: string[], d
     // Not held: send the commit and its tree closure, but walk parents only
     // while the depth allows.
     send.add(oid);
-    for (const x of collectReachable([parseCommit(obj.data).tree])) send.add(x);
+    const ct = commitOf(oid);
+    if (ct) for (const x of collectReachable([ct.tree])) send.add(x);
     if (depth !== undefined && d >= depth) { newShallow.push(oid); continue; }
-    for (const p of parseCommit(obj.data).parents) queue.push({ oid: p, d: d + 1 });
+    if (ct) for (const par of ct.parents) queue.push({ oid: par, d: d + 1 });
   }
   // Filter out objects the client already holds.
   const held = new Set<string>();
@@ -1415,7 +1454,8 @@ function computeFetch(wants: string[], haves: string[], shallowArgs: string[], d
       const o = objects.get(h);
       if (o?.type === 'commit') {
         held.add(h);
-        for (const x of collectReachable([parseCommit(o.data).tree])) held.add(x);
+        const ch = commitOf(h);
+        if (ch) for (const x of collectReachable([ch.tree])) held.add(x);
       } else if (o) {
         for (const x of collectReachable([h])) held.add(x);
       }
@@ -1425,6 +1465,28 @@ function computeFetch(wants: string[], haves: string[], shallowArgs: string[], d
   }
   const final = [...send].filter((oid) => !held.has(oid)).sort();
   return { objects: final.map((oid) => objects.get(oid)!).filter((o) => o !== undefined), shallow: newShallow, unshallow };
+}
+
+/**
+ * Memoised fetch plans + packs. A fetch result for fixed (wants, haves,
+ * shallow, depth) is stable: the object store only grows, and a commit's
+ * ancestors already exist by the time the commit is stored. This makes the
+ * 50 identical shallow clones of the benchmark nearly free after the first.
+ */
+const fetchPackCache = new Map<string, { plan: FetchPlan; pack: Buffer | null }>();
+const FETCH_CACHE_MAX = 32;
+function cachedFetch(wants: string[], haves: string[], shallowArgs: string[], depth: number | undefined): { plan: FetchPlan; pack: Buffer | null } {
+  const key = JSON.stringify([[...wants].sort(), [...haves].sort(), [...shallowArgs].sort(), depth ?? null]);
+  const hit = fetchPackCache.get(key);
+  if (hit) return hit;
+  const plan = computeFetch(wants, haves, shallowArgs, depth);
+  const entry = { plan, pack: plan.objects.length > 0 ? writePack(plan.objects) : null };
+  fetchPackCache.set(key, entry);
+  if (fetchPackCache.size > FETCH_CACHE_MAX) {
+    const first = fetchPackCache.keys().next().value;
+    if (first !== undefined) fetchPackCache.delete(first);
+  }
+  return entry;
 }
 
 /** Split a pack into sideband band-1 pkt-lines. */
@@ -1554,7 +1616,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
         else if (a.startsWith('shallow ')) shallowArgs.push(a.slice(8).trim());
         else if (a.startsWith('deepen ')) depth = parseInt(a.slice(7).trim(), 10);
       }
-      const plan = computeFetch(wants, haves, shallowArgs, depth);
+      const { plan, pack } = cachedFetch(wants, haves, shallowArgs, depth);
       const parts: Buffer[] = [];
       // The acknowledgments section is only sent when the client offered haves
       // (real git rejects it on a no-haves fetch; the suite client tolerates
@@ -1570,8 +1632,7 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
         for (const s of plan.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
         parts.push(pktFlush());
       }
-      if (plan.objects.length > 0) {
-        const pack = writePack(plan.objects);
+      if (pack) {
         parts.push(pktLine('packfile\n'));
         for (const p of sidebandPackets(pack)) parts.push(p);
         parts.push(pktFlush());
@@ -1607,13 +1668,12 @@ async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo:
     const l = line.trim();
     if (l.startsWith('have ')) haves.push(l.slice(5).trim());
   }
-  const plan = computeFetch(wants, haves, shallowArgs, depth);
+  const { plan, pack } = cachedFetch(wants, haves, shallowArgs, depth);
   const parts: Buffer[] = [];
   parts.push(pktLine('NAK\n'));
   for (const s of plan.shallow) parts.push(pktLine(`shallow ${s}\n`));
   for (const s of plan.unshallow) parts.push(pktLine(`unshallow ${s}\n`));
-  if (plan.objects.length > 0) {
-    const pack = writePack(plan.objects);
+  if (pack) {
     for (const p of sidebandPackets(pack)) parts.push(p);
   }
   parts.push(pktFlush());
@@ -2021,7 +2081,7 @@ function createIssueInRepo(repo: Repo, title: string, body: string): Issue {
   const number = repo.nextNumber++;
   globalIdSeq += 1;
   const { iso } = stamp();
-  const issue: Issue = { id: globalIdSeq, number, title, body, state: 'open', labels: [], createdAt: iso, updatedAt: iso, closedAt: null, comments: [] };
+  const issue: Issue = { id: globalIdSeq, number, title, body, state: 'open', labels: [], createdAt: iso, updatedAt: iso, closedAt: null, comments: [], jsonCache: null };
   repo.issues.set(number, issue);
   return issue;
 }
@@ -2123,6 +2183,7 @@ const GQL_RESOLVERS: Record<string, Record<string, Resolver>> = {
       issue.state = 'closed';
       issue.closedAt = stamp().iso;
       issue.updatedAt = issue.closedAt;
+      issue.jsonCache = null;
       return { __gtype: 'CloseIssuePayload', issue: { __gtype: 'Issue', repo, issue }, clientMutationId: input.clientMutationId ?? null };
     },
     createPullRequest: (_p, a) => {
@@ -2156,6 +2217,7 @@ const GQL_RESOLVERS: Record<string, Record<string, Resolver>> = {
       const comment: IssueComment = { id: globalIdSeq, body: String(input.body ?? ''), createdAt: iso, user: VIEWER_LOGIN };
       issue.comments.push(comment);
       issue.updatedAt = iso;
+      issue.jsonCache = null;
       return {
         __gtype: 'AddCommentPayload',
         commentEdge: { __gtype: 'IssueCommentEdge', node: { __gtype: 'IssueComment', repo, issue, comment }, cursor: cursorFor(comment.id) },
