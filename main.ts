@@ -2667,6 +2667,11 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<boo
 const server = createServer(async (req, res) => {
   try {
     const segs = pathSegments(req);
+    // The env's boot check calls GET /healthz (twice) before driving the suite.
+    if (segs.length === 1 && segs[0] === 'healthz' && req.method === 'GET') {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
     if (await handleRest(req, res, segs)) return;
     if (segs.length === 2 && segs[0] === 'api' && segs[1] === 'graphql' && req.method === 'POST') {
       if (await handleGraphql(req, res)) return;
